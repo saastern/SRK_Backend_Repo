@@ -156,7 +156,7 @@ def save_marks_sheet(request):
                         defaults={
                             'marks_obtained': Decimal(str(mark_data)) if mark_data else 0,
                             'max_marks': max_marks,
-                            'recorded_by': request.user if request.user.is_authenticated else None
+                            'entered_by': request.user if request.user.is_authenticated else None
                         }
                     )
             
@@ -348,11 +348,13 @@ class StudentMarksDetailAPIView(APIView):
                     'id': str(student.id),
                     'name': student.user.get_full_name() or f"Student {student.roll_number}",
                     'rollNo': str(student.roll_number).zfill(2) if isinstance(student.roll_number, int) or str(student.roll_number).isdigit() else str(student.roll_number),
-                    'className': student.student_class.name
+                    'className': student.student_class.name,
+                    'classId': str(student.student_class.id) if student.student_class else None,
                 },
                 'subjects': self.get_subjects_data(student, academic_year),
                 'termSummaries': self.get_term_summaries(student, academic_year),
-                'classConfig': self.get_class_config(student.student_class)
+                'classConfig': self.get_class_config(student.student_class),
+                'exams': self.get_exams_meta(),
             }
 
             return Response(response_data)
@@ -362,6 +364,19 @@ class StudentMarksDetailAPIView(APIView):
         except Exception as e:
             return Response({'error': str(e)}, status=500)
     
+    def get_exams_meta(self):
+        """Return exam id/name/key list so the editable grid can map cells -> exams."""
+        exams_meta = []
+        for exam_name in ['FA1', 'FA2', 'FA3', 'FA4', 'SA1', 'SA2']:
+            exam = Exam.objects.filter(name=exam_name).first()
+            if exam:
+                exams_meta.append({
+                    'id': exam.id,
+                    'name': exam.name,
+                    'key': exam.name.lower(),  # matches subject_data keys (fa1, sa1, ...)
+                })
+        return exams_meta
+
     def get_subjects_data(self, student, academic_year):
         """Get REAL subject marks data from database"""
         # Get all marks for this student
@@ -369,18 +384,29 @@ class StudentMarksDetailAPIView(APIView):
             student=student,
             academic_year=academic_year
         ).select_related('subject', 'exam')
-        
+
         # Get all subjects for this class
         class_subjects = ClassSubjectMapping.objects.filter(
             student_class=student.student_class,
             academic_year=academic_year
         ).select_related('subject')
-        
+
+        class_group = student.student_class.class_group
+        exams = list(Exam.objects.filter(name__in=['FA1', 'FA2', 'FA3', 'FA4', 'SA1', 'SA2']))
+        exams_by_key = {e.name.lower(): e for e in exams}
+
         subjects_data = []
-        
+
         for class_subject in class_subjects:
             subject = class_subject.subject
+
+            # `id` lets the editable grid map a cell -> (subject, exam).
+            # `examCaps` carries the max marks for every term even when no mark
+            # exists yet, so the editor can clamp input. We deliberately keep the
+            # per-cell `maxMarks` at 0 when empty so the read-only table still
+            # renders "N/A" for terms with no marks.
             subject_data = {
+                'id': subject.id,
                 'name': subject.name,
                 'fa1': {'marks': 0, 'grade': 'N/A', 'maxMarks': 0},
                 'fa2': {'marks': 0, 'grade': 'N/A', 'maxMarks': 0},
@@ -388,8 +414,12 @@ class StudentMarksDetailAPIView(APIView):
                 'fa4': {'marks': 0, 'grade': 'N/A', 'maxMarks': 0},
                 'sa1': {'marks': 0, 'grade': 'N/A', 'maxMarks': 0},
                 'sa2': {'marks': 0, 'grade': 'N/A', 'maxMarks': 0},
+                'examCaps': {
+                    key: (exams_by_key[key].get_max_marks(class_group, subject) if key in exams_by_key else 0)
+                    for key in ['fa1', 'fa2', 'fa3', 'fa4', 'sa1', 'sa2']
+                },
             }
-            
+
             # Fill with REAL marks data
             subject_marks = marks_queryset.filter(subject=subject)
             for mark in subject_marks:
@@ -400,9 +430,9 @@ class StudentMarksDetailAPIView(APIView):
                         'grade': mark.grade,
                         'maxMarks': mark.max_marks
                     }
-            
+
             subjects_data.append(subject_data)
-        
+
         return subjects_data
     
     def get_term_summaries(self, student, academic_year):

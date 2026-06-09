@@ -3,3 +3,4 @@ builder = "nixpacks"
 
 [deploy]
 startCommand = " gunicorn config.wsgi --bind 0.0.0.0:$PORT"
+preDeployCommand = "python manage.py migrate && python manage.py collectstatic --noinput"

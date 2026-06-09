@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from django.shortcuts import get_object_or_404
 from datetime import datetime
+from decimal import Decimal
 from .models import *
 from .services import GradingService
 from apps.students.models import Class
@@ -169,6 +170,200 @@ def enter_marks(request):
             'success': False,
             'message': f'Error: {str(e)}'
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Preferred subject display order for the marks grid
+SUBJECT_ORDER = {
+    'telugu': 1, 'hindi': 2, 'english': 3,
+    'mathematics': 4, 'maths': 4,
+    'physical science': 5, 'natural science': 6, 'science': 5,
+    'social studies': 7, 'social': 7,
+}
+
+
+def _subject_priority(name):
+    lower = (name or '').lower()
+    for key, priority in SUBJECT_ORDER.items():
+        if key in lower:
+            return priority
+    return 100
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_class_marks_grid(request):
+    """GET /api/assessments/marks-grid/?class_id=X&exam_id=Y
+
+    Returns the full editable grid (students x subjects) for a class + exam,
+    including any existing marks. Used by the React class-grid entry screen.
+    """
+    try:
+        class_id = request.GET.get('class_id')
+        exam_id = request.GET.get('exam_id')
+
+        if not class_id or not exam_id:
+            return Response({
+                'success': False,
+                'message': 'class_id and exam_id are required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        academic_year = AcademicYear.objects.filter(is_current=True).first()
+        if not academic_year:
+            return Response({
+                'success': False,
+                'message': 'No current academic year found'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        class_obj = get_object_or_404(Class, id=class_id)
+        exam = get_object_or_404(Exam, id=exam_id)
+        class_group = class_obj.class_group
+
+        # Students sorted numerically by roll number
+        from django.db.models.functions import Cast
+        from django.db.models import IntegerField
+        students = StudentProfile.objects.filter(
+            student_class=class_obj
+        ).select_related('user').annotate(
+            roll_int=Cast('roll_number', output_field=IntegerField())
+        ).order_by('roll_int')
+
+        # Subjects for this class, in display order
+        subject_mappings = list(ClassSubjectMapping.objects.filter(
+            student_class=class_obj,
+            academic_year=academic_year
+        ).select_related('subject'))
+        subject_mappings.sort(key=lambda m: _subject_priority(m.subject.name))
+        subjects = [m.subject for m in subject_mappings]
+
+        # Existing marks: { student_id: { subject_id: {marks, grade, is_absent} } }
+        existing_marks = {}
+        if subjects:
+            marks_qs = StudentMark.objects.filter(
+                student__student_class=class_obj,
+                exam=exam,
+                subject__in=subjects,
+                academic_year=academic_year
+            )
+            for mark in marks_qs:
+                sid = str(mark.student_id)
+                existing_marks.setdefault(sid, {})[str(mark.subject_id)] = {
+                    'marks': float(mark.marks_obtained),
+                    'grade': mark.grade,
+                    'is_absent': mark.is_absent,
+                }
+
+        return Response({
+            'success': True,
+            'academic_year_id': academic_year.id,
+            'class': {'id': class_obj.id, 'name': class_obj.name, 'class_group': class_group},
+            'exam': {'id': exam.id, 'name': exam.name, 'exam_type': exam.exam_type},
+            'subjects': [
+                {
+                    'id': m.subject.id,
+                    'name': m.subject.name,
+                    'is_main': m.is_main_subject,
+                    'max_marks': exam.get_max_marks(class_group, m.subject),
+                }
+                for m in subject_mappings
+            ],
+            'students': [
+                {
+                    'id': s.id,
+                    'name': s.user.get_full_name() or f'Student {s.roll_number}',
+                    'roll_number': s.roll_number,
+                }
+                for s in students
+            ],
+            'existing_marks': existing_marks,
+        })
+
+    except Exception as e:
+        return Response({
+            'success': False,
+            'message': f'Error: {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def save_class_marks_grid(request):
+    """POST /api/assessments/marks-grid/save/
+
+    Body: {
+      "class_id": X, "exam_id": Y,
+      "marks": { "<student_id>": { "<subject_id>": {"marks": 18, "is_absent": false}, ... }, ... }
+    }
+    Saves every cell, recomputes grades (via model.save) and per-student summaries.
+    """
+    try:
+        data = request.data
+        exam_id = data.get('exam_id')
+        marks_map = data.get('marks', {})
+
+        if not exam_id:
+            return Response({'success': False, 'message': 'exam_id is required'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        academic_year = AcademicYear.objects.filter(is_current=True).first()
+        if not academic_year:
+            return Response({'success': False, 'message': 'No current academic year found'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        exam = get_object_or_404(Exam, id=exam_id)
+
+        saved_cells = 0
+        for student_id, subjects_marks in marks_map.items():
+            student = get_object_or_404(StudentProfile, id=student_id)
+            class_group = student.student_class.class_group
+
+            for subject_id, cell in subjects_marks.items():
+                subject = get_object_or_404(Subject, id=subject_id)
+
+                # A cell can be a bare number or an object {marks, is_absent}
+                if isinstance(cell, dict):
+                    raw_marks = cell.get('marks')
+                    is_absent = cell.get('is_absent', False)
+                else:
+                    raw_marks = cell
+                    is_absent = False
+
+                # Skip empty cells so we don't overwrite with zeros unintentionally
+                if not is_absent and (raw_marks is None or raw_marks == ''):
+                    continue
+
+                max_marks = exam.get_max_marks(class_group, subject)
+                marks_value = Decimal('0') if is_absent else Decimal(str(raw_marks))
+
+                StudentMark.objects.update_or_create(
+                    student=student,
+                    subject=subject,
+                    exam=exam,
+                    academic_year=academic_year,
+                    defaults={
+                        'marks_obtained': marks_value,
+                        'max_marks': max_marks,
+                        'is_absent': is_absent,
+                        'entered_by': request.user,
+                    }
+                )
+                saved_cells += 1
+
+            # Recompute summary once per student
+            GradingService.calculate_student_exam_summary(
+                student.id, exam.id, academic_year.id
+            )
+
+        return Response({
+            'success': True,
+            'message': f'Saved {saved_cells} marks',
+            'saved': saved_cells,
+        })
+
+    except Exception as e:
+        return Response({
+            'success': False,
+            'message': f'Error: {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 @api_view(['GET'])
 def get_classes_and_exams(request):
