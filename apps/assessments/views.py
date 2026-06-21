@@ -14,6 +14,7 @@ from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 import json
 from .models import *
+from .services import GradingService
 from apps.students.models import Class, StudentProfile
 from decimal import Decimal
 
@@ -455,9 +456,13 @@ class StudentMarksDetailAPIView(APIView):
                     max_marks = sum(m.max_marks for m in exam_marks)
                     percentage = (total_marks / max_marks * 100) if max_marks > 0 else 0
                     
-                    # Calculate grade
-                    grade = self.calculate_overall_grade(percentage)
-                    
+                    # Calculate grade from the GradeScale table (single source of truth)
+                    grade = self.calculate_overall_grade(
+                        percentage,
+                        student.student_class.class_group,
+                        exam.exam_type,
+                    )
+
                     # Calculate class rank (simplified - you can enhance this)
                     class_rank = self.calculate_class_rank(student, exam, academic_year)
                     
@@ -476,16 +481,10 @@ class StudentMarksDetailAPIView(APIView):
         
         return summaries
     
-    def calculate_overall_grade(self, percentage):
-        """Calculate overall grade from percentage"""
-        if percentage >= 90: return 'A+'
-        elif percentage >= 80: return 'A'
-        elif percentage >= 70: return 'B+'
-        elif percentage >= 60: return 'B'
-        elif percentage >= 50: return 'C+'
-        elif percentage >= 40: return 'C'
-        elif percentage >= 33: return 'D'
-        else: return 'F'
+    def calculate_overall_grade(self, percentage, class_group, exam_type):
+        """Overall grade from the GradeScale table (single source of truth)."""
+        grade, _ = GradingService.get_grade_from_percentage(percentage, class_group, exam_type)
+        return grade
     
     def calculate_class_rank(self, student, exam, academic_year):
         """Calculate student's rank in class for this exam"""

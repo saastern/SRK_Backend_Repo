@@ -84,43 +84,38 @@ class GradingService:
     
     @staticmethod
     def get_grade_from_percentage(percentage, class_group, exam_type):
-        """Get grade and grade point from percentage using appropriate grade scale"""
-        try:
-            print(f"🔍 GRADING SERVICE START: {percentage}% class='{class_group}' exam='{exam_type}'")
-            # For FA exams, convert percentage back to marks for comparison
-            if exam_type == 'FA':
-                # Get max marks for this class group
-                max_marks_map = {'pre': 50, '1-2': 25, '3-5': 25, '6-10': 50}
-                max_marks = max_marks_map.get(class_group, 50)
-                marks = (percentage * max_marks) / 100
-                print(f"🔍 FA: max_marks={max_marks}, marks={marks} (type: {type(marks)})")
+        """Get grade and grade point from a percentage using the GradeScale table.
 
-            else:  # SA exam
-                marks = percentage  # SA percentage directly corresponds to marks out of 100
-                print(f"🔍 SA: marks={marks}")
-            
-            print(f"🔍 QUERY: class_group='{class_group}', exam_type='{exam_type}', marks={marks}")
-            # Find matching grade scale
-            grade_scale = GradeScale.objects.filter(
+        The GradeScale bands are stored in raw marks (e.g. 1-5/FA bands run 0..25),
+        so we convert the percentage back to marks against the *actual* ceiling of
+        the configured scale for this (class_group, exam_type) rather than a
+        hardcoded map. This is the single source of truth for grading.
+        """
+        try:
+            scales = GradeScale.objects.filter(
                 class_group=class_group,
                 exam_type=exam_type,
+            )
+
+            # Ceiling = the top of the highest configured band for this scale.
+            ceiling = max((s.max_marks for s in scales), default=0)
+            if ceiling <= 0:
+                return 'D2', Decimal('3.0')
+
+            marks = (Decimal(str(percentage)) * ceiling) / 100
+
+            grade_scale = scales.filter(
                 min_marks__lte=marks,
-                max_marks__gte=marks
-            ).first()
-            
-            print(f"🔍 RESULT: grade_scale={grade_scale} (type: {type(grade_scale)})")
+                max_marks__gte=marks,
+            ).order_by('-min_marks').first()
+
             if grade_scale:
-                print(f"🔍 RETURNING: {grade_scale.grade}")
                 return grade_scale.grade, grade_scale.grade_point
-            else:
-                print("🔍 No matching grade scale found.")
-                
+
         except Exception as e:
-            print(f"🔍 EXCEPTION: {e}")
             print(f"Error getting grade from percentage: {e}")
-        
-        # Default fallback
-        print("🔍 FINAL FALLBACK: D2")
+
+        # Default fallback (lowest band) when nothing matches
         return 'D2', Decimal('3.0')
     
     @staticmethod

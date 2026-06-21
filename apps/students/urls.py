@@ -8,5 +8,10 @@ urlpatterns = [
     path('class/<int:class_id>/', views.class_students, name='class_students'),
     path('add/', views.add_student, name='add_student'),
     path('add-bulk/', views.add_students_bulk, name='add_students_bulk'),
+
+    # Promotion / year rollover (Settings -> Promote Students)
+    path('promotion/preview/', views.promotion_preview, name='promotion_preview'),
+    path('promotion/run/', views.promotion_run, name='promotion_run'),
+
     path('<int:student_id>/delete/', views.delete_student, name='delete_student'),
 ]

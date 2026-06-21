@@ -3,6 +3,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
 from django.shortcuts import get_object_or_404
+from django.db import transaction
 from datetime import datetime
 from decimal import Decimal
 from .models import *
@@ -416,19 +417,14 @@ def get_student_marks(request, student_id, exam_id):
             max_marks += mark.max_marks
         
         percentage = (total_marks / max_marks * 100) if max_marks > 0 else 0
-        
-        # Calculate overall grade based on percentage
-        def calculate_overall_grade(percentage):
-            if percentage >= 91: return "A1", 10.0
-            elif percentage >= 81: return "A2", 9.0
-            elif percentage >= 71: return "B1", 8.0
-            elif percentage >= 61: return "B2", 7.0
-            elif percentage >= 51: return "C1", 6.0
-            elif percentage >= 41: return "C2", 5.0
-            elif percentage >= 33: return "D", 4.0
-            else: return "E", 0.0
-        
-        overall_grade, overall_gpa = calculate_overall_grade(percentage)
+
+        # Overall grade from the GradeScale table (single source of truth)
+        exam_obj = Exam.objects.filter(id=exam_id).first()
+        exam_type = exam_obj.exam_type if exam_obj else 'SA'
+        overall_grade, overall_gp = GradingService.get_grade_from_percentage(
+            percentage, student.student_class.class_group, exam_type
+        )
+        overall_gpa = float(overall_gp)
         
         # Calculate class rank
         from django.db.models import Sum, F
@@ -484,3 +480,127 @@ def get_student_marks(request, student_id, exam_id):
             'success': False,
             'message': str(e)
         }, status=500)
+
+
+# ---------------------------------------------------------------------------
+# Grade scale configuration (Settings -> Grade Configuration)
+# ---------------------------------------------------------------------------
+
+GRADE_CLASS_GROUPS = ['pre', '1-5', '6-10']
+GRADE_EXAM_TYPES = ['FA', 'SA']
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_grade_scales(request):
+    """GET /api/assessments/grade-scales/?class_group=1-5&exam_type=FA
+
+    Returns the ordered grade bands for a (class_group, exam_type) plus the
+    available option lists for the dropdowns.
+    """
+    class_group = request.GET.get('class_group')
+    exam_type = request.GET.get('exam_type')
+
+    bands = []
+    if class_group and exam_type:
+        qs = GradeScale.objects.filter(
+            class_group=class_group, exam_type=exam_type
+        ).order_by('-min_marks')
+        bands = [
+            {
+                'id': s.id,
+                'min_marks': s.min_marks,
+                'max_marks': s.max_marks,
+                'grade': s.grade,
+                'grade_point': float(s.grade_point),
+            }
+            for s in qs
+        ]
+
+    return Response({
+        'success': True,
+        'class_groups': GRADE_CLASS_GROUPS,
+        'exam_types': GRADE_EXAM_TYPES,
+        'bands': bands,
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def save_grade_scales(request):
+    """POST /api/assessments/grade-scales/save/
+
+    Body: { class_group, exam_type, bands: [{min_marks, max_marks, grade, grade_point}] }
+    Replace-all within the (class_group, exam_type): validate, delete existing,
+    recreate. Bands must be non-overlapping and start at 0.
+    """
+    data = request.data
+    class_group = data.get('class_group')
+    exam_type = data.get('exam_type')
+    bands = data.get('bands', [])
+
+    if class_group not in GRADE_CLASS_GROUPS:
+        return Response({'success': False, 'message': 'Invalid class_group'},
+                        status=status.HTTP_400_BAD_REQUEST)
+    if exam_type not in GRADE_EXAM_TYPES:
+        return Response({'success': False, 'message': 'Invalid exam_type'},
+                        status=status.HTTP_400_BAD_REQUEST)
+    if not bands:
+        return Response({'success': False, 'message': 'At least one band is required'},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    # Normalise + validate each band
+    cleaned = []
+    for i, b in enumerate(bands):
+        try:
+            min_m = int(b['min_marks'])
+            max_m = int(b['max_marks'])
+            grade = str(b['grade']).strip()
+            gp = Decimal(str(b['grade_point']))
+        except (KeyError, ValueError, TypeError):
+            return Response({'success': False, 'message': f'Band {i + 1} has invalid values'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if not grade:
+            return Response({'success': False, 'message': f'Band {i + 1} is missing a grade label'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if min_m > max_m:
+            return Response({'success': False, 'message': f'Band {grade}: min cannot exceed max'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        cleaned.append({'min': min_m, 'max': max_m, 'grade': grade, 'gp': gp})
+
+    # Check for overlaps and that the lowest band starts at 0
+    ordered = sorted(cleaned, key=lambda x: x['min'])
+    if ordered[0]['min'] != 0:
+        return Response({'success': False, 'message': 'The lowest band must start at 0'},
+                        status=status.HTTP_400_BAD_REQUEST)
+    for prev, nxt in zip(ordered, ordered[1:]):
+        if nxt['min'] <= prev['max']:
+            return Response({
+                'success': False,
+                'message': f"Bands overlap: {prev['grade']} (..{prev['max']}) and {nxt['grade']} ({nxt['min']}..)",
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        with transaction.atomic():
+            GradeScale.objects.filter(
+                class_group=class_group, exam_type=exam_type
+            ).delete()
+            GradeScale.objects.bulk_create([
+                GradeScale(
+                    class_group=class_group,
+                    exam_type=exam_type,
+                    min_marks=c['min'],
+                    max_marks=c['max'],
+                    grade=c['grade'],
+                    grade_point=c['gp'],
+                )
+                for c in cleaned
+            ])
+    except Exception as e:
+        return Response({'success': False, 'message': f'Error: {str(e)}'},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    return Response({
+        'success': True,
+        'message': f'Saved {len(cleaned)} grade bands for {class_group} / {exam_type}',
+    })

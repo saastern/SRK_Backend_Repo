@@ -10,6 +10,7 @@ from django.utils.crypto import get_random_string
 from .models import StudentProfile
 from apps.students.models import Class
 from apps.users.models import User
+from apps.assessments.models import AcademicYear, ClassSubjectMapping
 
 
 @api_view(['GET'])
@@ -226,3 +227,152 @@ def delete_student(request, student_id):
     user.delete()
 
     return Response({'success': True, 'message': f'{name} removed successfully'})
+
+
+# ---------------------------------------------------------------------------
+# Promotion / year rollover (Settings -> Promote Students)
+# ---------------------------------------------------------------------------
+
+def _ordered_classes():
+    """All classes ordered by their promotion order (lowest -> highest)."""
+    return list(Class.objects.all().order_by('order', 'name'))
+
+
+def _next_class_map(classes):
+    """Map each class -> the next-higher class (None for the final class)."""
+    mapping = {}
+    for i, cls in enumerate(classes):
+        mapping[cls.id] = classes[i + 1] if i + 1 < len(classes) else None
+    return mapping
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def promotion_preview(request):
+    """GET /api/students/promotion/preview/
+
+    Shows what a year rollover would do: each class, its student count, and the
+    class students would move into ("Graduate" for the final class).
+    """
+    classes = _ordered_classes()
+    nxt = _next_class_map(classes)
+
+    needs_order_setup = any((c.order or 0) == 0 for c in classes)
+
+    rows = []
+    for cls in classes:
+        target = nxt[cls.id]
+        rows.append({
+            'class_id': cls.id,
+            'class_name': cls.name,
+            'order': cls.order,
+            'student_count': cls.studentprofile_set.count(),
+            'next_class_name': target.name if target else 'Graduate',
+            'graduates': target is None,
+        })
+
+    current_year = AcademicYear.objects.filter(is_current=True).first()
+
+    return Response({
+        'success': True,
+        'rows': rows,
+        'current_year': current_year.name if current_year else None,
+        'needs_order_setup': needs_order_setup,
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def promotion_run(request):
+    """POST /api/students/promotion/run/
+
+    Body: { new_year_name, start_date, end_date }
+    Creates + activates a new academic year, copies the subject mappings into it,
+    promotes every student up one class, and graduates the final class.
+    """
+    data = request.data
+    new_year_name = str(data.get('new_year_name', '')).strip()
+    start_date = data.get('start_date')
+    end_date = data.get('end_date')
+
+    if not new_year_name or not start_date or not end_date:
+        return Response({
+            'success': False,
+            'message': 'new_year_name, start_date and end_date are required',
+        }, status=400)
+
+    if AcademicYear.objects.filter(name=new_year_name).exists():
+        return Response({
+            'success': False,
+            'message': f'Academic year "{new_year_name}" already exists',
+        }, status=400)
+
+    classes = _ordered_classes()
+    if not classes:
+        return Response({'success': False, 'message': 'No classes found'}, status=400)
+
+    nxt = _next_class_map(classes)
+    prev_year = AcademicYear.objects.filter(is_current=True).first()
+
+    promoted_count = 0
+    graduated_count = 0
+
+    try:
+        with transaction.atomic():
+            # 1. Create + activate the new academic year.
+            #    AcademicYear.save() clears is_current on the others.
+            new_year = AcademicYear.objects.create(
+                name=new_year_name,
+                start_date=start_date,
+                end_date=end_date,
+                is_current=True,
+                is_active=True,
+            )
+
+            # 2. Copy subject mappings from the previous year so the new year
+            #    has subjects for marks entry.
+            if prev_year:
+                old_mappings = ClassSubjectMapping.objects.filter(academic_year=prev_year)
+                ClassSubjectMapping.objects.bulk_create([
+                    ClassSubjectMapping(
+                        student_class=m.student_class,
+                        subject=m.subject,
+                        is_main_subject=m.is_main_subject,
+                        academic_year=new_year,
+                    )
+                    for m in old_mappings
+                ])
+
+            # 3. Promote students, processing classes from highest order down so
+            #    we never move the same students twice.
+            for cls in reversed(classes):
+                target = nxt[cls.id]
+                students = StudentProfile.objects.filter(student_class=cls).select_related('user')
+                if target is None:
+                    # Final class -> graduate (keep records, drop from active lists)
+                    for s in students:
+                        s.student_class = None
+                        s.save(update_fields=['student_class'])
+                        if s.user.is_active:
+                            s.user.is_active = False
+                            s.user.save(update_fields=['is_active'])
+                        graduated_count += 1
+                else:
+                    for s in students:
+                        s.student_class = target
+                        s.save(update_fields=['student_class'])
+                        promoted_count += 1
+
+    except Exception as e:
+        return Response({'success': False, 'message': f'Error: {str(e)}'}, status=500)
+
+    return Response({
+        'success': True,
+        'message': (
+            f'Promoted {promoted_count} students, graduated {graduated_count}. '
+            f'New academic year {new_year_name} is now active.'
+        ),
+        'promoted_count': promoted_count,
+        'graduated_count': graduated_count,
+        'new_year': new_year_name,
+    })
