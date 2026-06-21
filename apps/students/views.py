@@ -269,15 +269,13 @@ CANONICAL_CLASS_ORDER = {
 }
 
 
-@api_view(['POST'])
-@permission_classes([IsAuthenticated])
-def set_class_orders(request):
-    """POST /api/students/classes/set-orders/
-
-    Sets each Class.order from a canonical, exact (normalized) name match -- no
+def apply_class_orders():
+    """Set Class.order from a canonical, exact (normalized) name match -- no
     substring matching, so '1' never collides with '10'. Deletes junk classes
     that have 0 students and an unrecognized name (e.g. a stray '.').
-    Returns what it did so the UI can show it.
+
+    Reusable by both the API view and the management command. Returns a dict
+    describing what changed.
     """
     updated = []
     unrecognized = []
@@ -302,15 +300,25 @@ def set_class_orders(request):
             else:
                 unrecognized.append({'name': cls.name, 'students': cls.studentprofile_set.count()})
 
-    return Response({
-        'success': True,
-        'message': f'Set order on {len(updated)} classes'
-                   + (f', deleted {len(deleted)} empty junk class(es)' if deleted else '')
-                   + (f', {len(unrecognized)} unrecognized non-empty class(es) need manual order' if unrecognized else ''),
+    message = (
+        f'Set order on {len(updated)} classes'
+        + (f', deleted {len(deleted)} empty junk class(es)' if deleted else '')
+        + (f', {len(unrecognized)} unrecognized non-empty class(es) need manual order' if unrecognized else '')
+    )
+    return {
+        'message': message,
         'updated': sorted(updated, key=lambda x: x['order']),
         'deleted': deleted,
         'unrecognized': unrecognized,
-    })
+    }
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def set_class_orders(request):
+    """POST /api/students/classes/set-orders/ -- see apply_class_orders()."""
+    result = apply_class_orders()
+    return Response({'success': True, **result})
 
 
 @api_view(['GET'])
