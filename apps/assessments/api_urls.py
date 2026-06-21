@@ -18,6 +18,10 @@ urlpatterns = [
     path('grade-scales/', get_grade_scales, name='api-grade-scales'),
     path('grade-scales/save/', save_grade_scales, name='api-grade-scales-save'),
 
+    # Per-class subject configuration (Settings -> Subject Configuration)
+    path('class-subjects/', get_class_subjects_config, name='api-class-subjects'),
+    path('class-subjects/save/', save_class_subjects_config, name='api-class-subjects-save'),
+
     # Authentication
     path('auth/login/', teacher_login_api, name='api-teacher-login'),
 ]

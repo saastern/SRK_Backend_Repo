@@ -119,7 +119,7 @@ def get_marks_sheet_data(request):
                         'id': s.subject.id,
                         'name': s.subject.name,
                         'is_main': s.is_main_subject,
-                        'max_marks': selected_exam.get_max_marks(class_group, s.subject)
+                        'max_marks': selected_exam.get_max_marks(class_group, s.subject, selected_class)
                     } for s in subjects
                 ],
                 'existing_marks': existing_marks,
@@ -147,7 +147,7 @@ def save_marks_sheet(request):
                 for subject_id, mark_data in subjects_marks.items():
                     subject = Subject.objects.get(id=subject_id)
                     
-                    max_marks = exam.get_max_marks(class_group, subject)
+                    max_marks = exam.get_max_marks(class_group, subject, student.student_class)
                     # Update or create mark
                     StudentMark.objects.update_or_create(
                         student=student,
@@ -222,23 +222,9 @@ def get_class_results(request):
         
     return Response({'results': results})
 
-@api_view(['POST'])
-@permission_classes([AllowAny])
-def initialize_class_orders(request):
-    """Utility to set default class orders with exact and partial matching"""
-    order_map = {
-        'Nursery': 1, 'LKG': 2, 'UKG': 3,
-        '1st': 10, '2nd': 20, '3rd': 30, '4th': 40, '5th': 50,
-        '6th': 60, '7th': 70, '8th': 80, '9th': 90, '10th': 100,
-        # Common variations
-        '1': 10, '2': 20, '3': 30, '4': 40, '5': 50,
-        '6': 60, '7': 70, '8': 80, '9': 90, '10': 100
-    }
-    updated = 0
-    for name, order in order_map.items():
-        count = Class.objects.filter(name__icontains=name).update(order=order)
-        updated += count
-    return Response({'success': True, 'updated': updated})
+# NOTE: initialize_class_orders removed — its name__icontains matching caused
+# '1' to also match '10' (collisions). Use POST /api/students/classes/set-orders/
+# (students.views.set_class_orders) which does exact, normalized matching.
 
 class ClassListAPIView(APIView):
     """GET /api/assessments/classes/ - List all classes with student counts"""
@@ -416,7 +402,7 @@ class StudentMarksDetailAPIView(APIView):
                 'sa1': {'marks': 0, 'grade': 'N/A', 'maxMarks': 0},
                 'sa2': {'marks': 0, 'grade': 'N/A', 'maxMarks': 0},
                 'examCaps': {
-                    key: (exams_by_key[key].get_max_marks(class_group, subject) if key in exams_by_key else 0)
+                    key: (exams_by_key[key].get_max_marks(class_group, subject, student.student_class) if key in exams_by_key else 0)
                     for key in ['fa1', 'fa2', 'fa3', 'fa4', 'sa1', 'sa2']
                 },
             }

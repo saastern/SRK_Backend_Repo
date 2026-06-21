@@ -139,8 +139,10 @@ def enter_marks(request):
             is_absent = mark_entry.get('is_absent', False)
             
             student = get_object_or_404(StudentProfile, id=student_id)
-            max_marks = exam.get_max_marks(student.student_class.class_group)
-            
+            max_marks = exam.get_max_marks(
+                student.student_class.class_group, subject, student.student_class
+            )
+
             # Create or update marks
             student_mark, created = StudentMark.objects.update_or_create(
                 student=student,
@@ -262,7 +264,7 @@ def get_class_marks_grid(request):
                     'id': m.subject.id,
                     'name': m.subject.name,
                     'is_main': m.is_main_subject,
-                    'max_marks': exam.get_max_marks(class_group, m.subject),
+                    'max_marks': exam.get_max_marks(class_group, m.subject, class_obj),
                 }
                 for m in subject_mappings
             ],
@@ -331,7 +333,7 @@ def save_class_marks_grid(request):
                 if not is_absent and (raw_marks is None or raw_marks == ''):
                     continue
 
-                max_marks = exam.get_max_marks(class_group, subject)
+                max_marks = exam.get_max_marks(class_group, subject, student.student_class)
                 marks_value = Decimal('0') if is_absent else Decimal(str(raw_marks))
 
                 StudentMark.objects.update_or_create(
@@ -603,4 +605,129 @@ def save_grade_scales(request):
     return Response({
         'success': True,
         'message': f'Saved {len(cleaned)} grade bands for {class_group} / {exam_type}',
+    })
+
+
+# ---------------------------------------------------------------------------
+# Per-class subject configuration (Settings -> Subject Configuration)
+# ---------------------------------------------------------------------------
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_class_subjects_config(request):
+    """GET /api/assessments/class-subjects/?class_id=X
+
+    Returns every subject with whether the class studies it this year, its
+    main/optional flag, and configured FA/SA max marks.
+    """
+    class_id = request.GET.get('class_id')
+    if not class_id:
+        return Response({'success': False, 'message': 'class_id is required'},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    class_obj = get_object_or_404(Class, id=class_id)
+    academic_year = AcademicYear.objects.filter(is_current=True).first()
+    if not academic_year:
+        return Response({'success': False, 'message': 'No current academic year'},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    # Existing mappings keyed by subject id
+    existing = {
+        m.subject_id: m
+        for m in ClassSubjectMapping.objects.filter(
+            student_class=class_obj, academic_year=academic_year
+        )
+    }
+
+    fa_exam = Exam.objects.filter(exam_type='FA').first()
+    sa_exam = Exam.objects.filter(exam_type='SA').first()
+
+    subjects = []
+    for subj in Subject.objects.filter(is_active=True).order_by('name'):
+        m = existing.get(subj.id)
+        if m:
+            fa = m.fa_max_marks
+            sa = m.sa_max_marks
+        else:
+            # Suggest sensible defaults for unselected subjects
+            fa = fa_exam._default_max_marks(class_obj.class_group, subj) if fa_exam else 0
+            sa = sa_exam._default_max_marks(class_obj.class_group, subj) if sa_exam else 0
+        subjects.append({
+            'subject_id': subj.id,
+            'name': subj.name,
+            'selected': m is not None,
+            'is_main': m.is_main_subject if m else True,
+            'fa_max': fa,
+            'sa_max': sa,
+        })
+
+    return Response({
+        'success': True,
+        'class': {'id': class_obj.id, 'name': class_obj.name, 'class_group': class_obj.class_group},
+        'subjects': subjects,
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def save_class_subjects_config(request):
+    """POST /api/assessments/class-subjects/save/
+
+    Body: { class_id, subjects: [{subject_id, is_main, fa_max, sa_max}] }
+    Replace-all the mappings for (class, current year): the listed subjects are
+    the ones the class studies; any not listed are removed.
+    """
+    data = request.data
+    class_id = data.get('class_id')
+    subjects = data.get('subjects', [])
+
+    if not class_id:
+        return Response({'success': False, 'message': 'class_id is required'},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    class_obj = get_object_or_404(Class, id=class_id)
+    academic_year = AcademicYear.objects.filter(is_current=True).first()
+    if not academic_year:
+        return Response({'success': False, 'message': 'No current academic year'},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    # Validate
+    cleaned = []
+    for i, s in enumerate(subjects):
+        try:
+            subject_id = int(s['subject_id'])
+            is_main = bool(s.get('is_main', True))
+            fa = int(s.get('fa_max', 0) or 0)
+            sa = int(s.get('sa_max', 0) or 0)
+        except (KeyError, ValueError, TypeError):
+            return Response({'success': False, 'message': f'Subject row {i + 1} is invalid'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if fa < 0 or sa < 0:
+            return Response({'success': False, 'message': f'Subject row {i + 1}: max marks cannot be negative'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        cleaned.append({'subject_id': subject_id, 'is_main': is_main, 'fa': fa, 'sa': sa})
+
+    try:
+        with transaction.atomic():
+            ClassSubjectMapping.objects.filter(
+                student_class=class_obj, academic_year=academic_year
+            ).delete()
+            ClassSubjectMapping.objects.bulk_create([
+                ClassSubjectMapping(
+                    student_class=class_obj,
+                    subject_id=c['subject_id'],
+                    academic_year=academic_year,
+                    is_main_subject=c['is_main'],
+                    fa_max_marks=c['fa'],
+                    sa_max_marks=c['sa'],
+                )
+                for c in cleaned
+            ])
+    except Exception as e:
+        return Response({'success': False, 'message': f'Error: {str(e)}'},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    return Response({
+        'success': True,
+        'message': f'Saved {len(cleaned)} subjects for {class_obj.name}',
     })

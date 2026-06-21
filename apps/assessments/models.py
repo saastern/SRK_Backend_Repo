@@ -41,7 +41,11 @@ class ClassSubjectMapping(models.Model):
     subject = models.ForeignKey(Subject, on_delete=models.CASCADE)
     is_main_subject = models.BooleanField(default=True)  # False for optional subjects
     academic_year = models.ForeignKey(AcademicYear, on_delete=models.CASCADE)
-    
+
+    # Per class-subject max marks (0 = not configured -> fall back to defaults)
+    fa_max_marks = models.PositiveIntegerField(default=0)
+    sa_max_marks = models.PositiveIntegerField(default=0)
+
     class Meta:
         unique_together = ['student_class', 'subject', 'academic_year']
         indexes = [
@@ -71,24 +75,49 @@ class Exam(models.Model):
     def __str__(self):
         return self.name
     
-    def get_max_marks(self, class_group,subject=None):
-        """Get max marks based on class group and exam type"""
-        
+    def get_max_marks(self, class_group, subject=None, student_class=None):
+        """Max marks for this exam.
+
+        Primary source: the per class-subject configuration stored on
+        ClassSubjectMapping (fa_max_marks / sa_max_marks) for the current
+        academic year. When that is not configured (0) or we don't have enough
+        info to look it up, fall back to the legacy hardcoded defaults so
+        nothing returns 0 unexpectedly.
+        """
+        # 1. Configured value (preferred)
+        if student_class is not None and subject is not None:
+            current_year = AcademicYear.objects.filter(is_current=True).first()
+            if current_year:
+                mapping = ClassSubjectMapping.objects.filter(
+                    student_class=student_class,
+                    subject=subject,
+                    academic_year=current_year,
+                ).first()
+                if mapping:
+                    configured = mapping.sa_max_marks if self.exam_type == 'SA' else mapping.fa_max_marks
+                    if configured and configured > 0:
+                        return configured
+
+        # 2. Legacy fallback
+        return self._default_max_marks(class_group, subject)
+
+    def _default_max_marks(self, class_group, subject=None):
+        """Legacy hardcoded defaults used only when no config exists."""
         # Special handling for science subjects
         if subject and subject.name in ['Physical Science', 'Natural Science']:
             if self.exam_type == 'SA':
-                return 50 
+                return 50
             else:  # FA
                 return 25
-        
+
         # Regular subjects
         if self.exam_type == 'SA':
             return 100  # SA is always 100 for all classes
-        
+
         # FA max marks vary by class group
         fa_max_marks = {
             'pre': 50,     # LKG-UKG: 50 marks
-            '1-2': 25, 
+            '1-2': 25,
             '1-5': 25,
             '3-5': 25,
             '6-7': 50,

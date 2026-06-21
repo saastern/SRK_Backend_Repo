@@ -246,6 +246,73 @@ def _next_class_map(classes):
     return mapping
 
 
+def _normalize_class_name(name):
+    """Lowercase and strip dots/spaces so 'L.K.G' -> 'lkg', 'Class 1' -> 'class1'."""
+    return ''.join((name or '').lower().split()).replace('.', '')
+
+
+# Canonical promotion order (lowest -> highest). Keys are normalized names.
+CANONICAL_CLASS_ORDER = {
+    'nursery': 1,
+    'lkg': 2,
+    'ukg': 3,
+    '1': 10, '1st': 10, 'class1': 10,
+    '2': 20, '2nd': 20, 'class2': 20,
+    '3': 30, '3rd': 30, 'class3': 30,
+    '4': 40, '4th': 40, 'class4': 40,
+    '5': 50, '5th': 50, 'class5': 50,
+    '6': 60, '6th': 60, 'class6': 60,
+    '7': 70, '7th': 70, 'class7': 70,
+    '8': 80, '8th': 80, 'class8': 80,
+    '9': 90, '9th': 90, 'class9': 90,
+    '10': 100, '10th': 100, 'class10': 100,
+}
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def set_class_orders(request):
+    """POST /api/students/classes/set-orders/
+
+    Sets each Class.order from a canonical, exact (normalized) name match -- no
+    substring matching, so '1' never collides with '10'. Deletes junk classes
+    that have 0 students and an unrecognized name (e.g. a stray '.').
+    Returns what it did so the UI can show it.
+    """
+    updated = []
+    unrecognized = []
+    deleted = []
+
+    with transaction.atomic():
+        for cls in Class.objects.all():
+            key = _normalize_class_name(cls.name)
+            order = CANONICAL_CLASS_ORDER.get(key)
+
+            if order is not None:
+                if cls.order != order:
+                    cls.order = order
+                    cls.save(update_fields=['order'])
+                updated.append({'name': cls.name, 'order': order})
+                continue
+
+            # Unrecognized name. Delete only if it's empty (junk), else flag it.
+            if cls.studentprofile_set.count() == 0:
+                deleted.append(cls.name)
+                cls.delete()
+            else:
+                unrecognized.append({'name': cls.name, 'students': cls.studentprofile_set.count()})
+
+    return Response({
+        'success': True,
+        'message': f'Set order on {len(updated)} classes'
+                   + (f', deleted {len(deleted)} empty junk class(es)' if deleted else '')
+                   + (f', {len(unrecognized)} unrecognized non-empty class(es) need manual order' if unrecognized else ''),
+        'updated': sorted(updated, key=lambda x: x['order']),
+        'deleted': deleted,
+        'unrecognized': unrecognized,
+    })
+
+
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def promotion_preview(request):
